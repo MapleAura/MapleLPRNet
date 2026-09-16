@@ -11,8 +11,8 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.dataset import LPRDataSet
-from model.lprnet import LPRNet, CHARS
-from utils.general import decode, sparse_tuple_for_ctc, set_logging
+from model.lprnet import LPRNetV2, CHARS
+from utils.general import decode, sparse_tuple_for_ctc, resolve_head_cfg, set_logging
 
 logger = logging.getLogger(__name__)
 set_logging()
@@ -68,11 +68,11 @@ def test(model, data_loader, dataset, device, ctc_loss, lpr_max_len, float_test=
 def load_image(file, img_size):
     image = cv2.imread(file)
 
-    # 缩放
-    image = cv2.resize(image, img_size)[:, :, ::-1]
+    # 缩放（与 test.py 中 LPRDataSet 的预处理保持一致，不加 BGR->RGB 通道翻转）
+    image = cv2.resize(image, img_size)
 
     # 归一化
-    image = (image.astype('float32') - 127.5) * 0.007843
+    image = (image.astype('float32') - 127.5) / 127.5
 
     # to tensor
     image = torch.from_numpy(image.transpose((2, 0, 1))).contiguous()
@@ -85,16 +85,38 @@ def main(opts):
     device = torch.device("cuda:0" if (not opts.cpu and torch.cuda.is_available()) else "cpu")
     logger.info('Use device %s.' % device)
 
-    # 定义网络
-    model = LPRNet(class_num=len(CHARS), dropout_rate=opts.dropout_rate).to(device)
-    logger.info("Build network is successful.")
-
     # Load weights
     ckpt = torch.load(opts.weights, map_location=device)
 
-    # 加载网络
-    model.load_state_dict(ckpt["model"])
+    # 定义网络(自动识别 checkpoint 中的 width_mult)
+    width_candidates = []
+    if 'width_mult' in ckpt:
+        width_candidates.append(ckpt['width_mult'])
+    for w in (opts.width_mult, 1.0):
+        if w not in width_candidates:
+            width_candidates.append(w)
+    head_cfg = resolve_head_cfg(ckpt.get('head_cfg'), opts.grid_h, opts.grid_w)
+    model = None
+    last_err = None
+    for w in width_candidates:
+        try:
+            m = LPRNetV2(8, True, class_num=len(CHARS), dropout_rate=opts.dropout_rate,
+                         width_mult=w, img_size=opts.img_size, **head_cfg).to(device)
+            m.load_state_dict(ckpt["model"])
+            model = m
+            if w != opts.width_mult:
+                logger.info('Auto detect width_mult=%.2f from checkpoint.' % w)
+            break
+        except RuntimeError as e:
+            last_err = e
+            continue
+    if model is None:
+        raise RuntimeError('Failed to load checkpoint %s with width_mult in %s; last error: %s'
+                           % (opts.weights, width_candidates, last_err))
+    del ckpt
     model.eval()
+    logger.info('Time steps T=%d (grid_size=%s).' % (int(model.head_cfg['grid_size'][1]), model.head_cfg['grid_size']))
+    logger.info("Build network is successful.")
 
     # Print
     logger.info('Load weights completed.')
@@ -112,12 +134,16 @@ def main(opts):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='LPRNet detecting')
-    parser.add_argument('--source-dir', type=str, default="figures", help='train images source dir.')
+    parser.add_argument('--source-dir', type=str, default="", help='train images source dir.')
     parser.add_argument('--weights', type=str, default="", help='initial weights path.')
-    parser.add_argument('--img-size', default=(94, 24), help='the image size')
+    parser.add_argument('--img-size', default=(128, 48), type=lambda s: tuple(map(int, s.split(','))),
+                        help='the image size, e.g. 160,48')
     parser.add_argument('--dropout_rate', default=0.5, help='dropout rate.')
+    parser.add_argument('--width-mult', type=float, default=1, help='LPRNetV2 channel width multiplier, auto detected from checkpoint when mismatched.')
     parser.add_argument('--cpu', action='store_true', help='force use cpu.')
-    parser.add_argument('--lpr-max-len', default=18, help='license plate number max length.')
+    parser.add_argument('--grid-h', type=int, default=4, help='head grid height, only used when the checkpoint has no head_cfg (old checkpoints).')
+    parser.add_argument('--grid-w', type=int, default=18, help='head grid width / CTC time steps, only used when the checkpoint has no head_cfg (old checkpoints).')
+    parser.add_argument('--lpr-max-len', type=int, default=None, help='license plate number max length (unused, kept for CLI compatibility).')
     args = parser.parse_args()
 
     # 打印参数
